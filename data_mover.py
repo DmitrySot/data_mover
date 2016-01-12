@@ -37,7 +37,7 @@ from os.path import isfile, join
 
 from eventlet import GreenPool, Timeout
 from eventlet.green import subprocess
-
+from eventlet.support.greenlets import GreenletExit
 
 from swift.common.utils import whataremyips, get_logger, \
     config_true_value, ismount, unlink_older_than, rsync_ip
@@ -62,13 +62,14 @@ def device_dict(ring_data):
     :param ring_data: ring dat structure
 
     :returns: dictionary that contains the devices from the ring structure
+              the dictionary maps the device ID to its node ip and name
     """
 
     ret_dict = {}
-    for dev in ring_data.to_dict()['devs']:
-        if dev is None:
+    for device in ring_data.to_dict()['devs']:
+        if device is None:
             continue
-        ret_dict[str(dev['id'])] = (dev['ip'], dev['device'])
+        ret_dict[str(device['id'])] = (device['ip'], device['device'])
 
     return ret_dict
 
@@ -77,7 +78,7 @@ def build_moving_map(old_ring_data, new_ring_data, bound=float('inf')):
     """
     Create a moving map structure, that represents the data moving plan
     For each partition that should be moved this structure
-    defines the source and destination devices
+    defines the source_set and destination_set devices
     The amount of partition that would be scanned during this process
     can be bounded by bound parameter,
     at this case the moving map would be partial,
@@ -91,24 +92,57 @@ def build_moving_map(old_ring_data, new_ring_data, bound=float('inf')):
     """
 
     ret_dict = {}
+    # a, b, c are lists of the devices that hold the first,second, and third
+    # replicas from the old ring.
+    # e.g. a[partition_id] represents the ID of the device
+    # that holds the first replica of the "partition_id" partition
+    # based on the old ring
     a, b, c = old_ring_data.to_dict()['replica2part2dev_id']
+
+    # x, y, z are lists of the devices that hold the first,second, and third
+    # replicas from the new ring.
+    # e.g. x[partition_id] represents the ID of the device
+    # that holds the first replica of the "partition_id" partition
+    # based on the new ring
     x, y, z = new_ring_data.to_dict()['replica2part2dev_id']
+
     array_size = min(bound, len(x))
 
-    for i in range(array_size):
-        old = Set([a[i], b[i], c[i]])
-        new = Set([x[i], y[i], z[i]])
-        source = old.difference(new)
-        destination = new.difference(old)
+    for partition_id in range(array_size):
+        # old_devices - the set of the devices that hold all the replicas
+        # of partition_id based on the old ring
+        old_devices = Set([a[partition_id], b[partition_id], c[partition_id]])
+        # new_devices - the set of the devices that hold all the replicas
+        # of partition_id based on the new ring
+        new_devices = Set([x[partition_id], y[partition_id], z[partition_id]])
 
-        if len(source) != len(destination):
-            print "Error"
+        # source_set - set of devices that no more hold the partition_id
+        source_set = old_devices.difference(new_devices)
+        # destination_set - set of devices that should get the partition_id
+        # from the source_set devices
+        destination_set = new_devices.difference(old_devices)
 
-        while len(source) > 0:
-            source_dev = source.pop()
-            destination_dev = destination.pop()
-            ret_dict["%s_%s" % (source_dev, i)] =\
-                (map(str, [i, source_dev, destination_dev]))
+        if len(source_set) != len(destination_set):
+            raise Exception("len(source_set) != len(destination_set)")
+
+        while len(source_set) > 0:
+            source_device = source_set.pop()
+            destination_device = destination_set.pop()
+
+            # partition_id is stored on multiple devices,
+            # to allow a fast check if a given device should
+            # care for a given partition
+            # the pair (source_device, partition_id) will be used
+            # as a key of the mover map dictionary
+            # to make it human readable it will be encoded as string
+            # "<device_id>_<partition_id>".
+            # the dictionary value would be a triplet
+            # partition_id, source_device_id, destination_device_id
+            # this information would be used for creation of job
+            # for partition movement.
+
+            ret_dict["%s_%s" % (source_device, partition_id)] =\
+                (map(str, [partition_id, source_device, destination_device]))
 
     return ret_dict
 
@@ -123,13 +157,15 @@ def print_moving_map(old_ring_data, new_ring_data, bound=float('inf')):
     :param bound: bounds the amount of partitions that would be scanned
     """
 
-    old_dict = device_dict(old_ring_data)
-    new_dict = device_dict(new_ring_data)
+    old_ring_dict = device_dict(old_ring_data)
+    new_ring_dict = device_dict(new_ring_data)
     moving_map = build_moving_map(old_ring_data, new_ring_data, bound)
 
     for key in moving_map:
-        part, source, dest = moving_map[key]
-        print part, old_dict[source], new_dict[dest]
+        partition_id, source_device_id, destination_device_id = moving_map[key]
+        print (partition_id,
+               old_ring_dict[source_device_id],
+               new_ring_dict[destination_device_id])
 
 
 def dump_moving_map(old_ring_data, new_ring_data,
@@ -143,14 +179,13 @@ def dump_moving_map(old_ring_data, new_ring_data,
     :param file_name: the moving map dump file name
     """
 
-    old_dict = device_dict(old_ring_data)
-    new_dict = device_dict(new_ring_data)
-
+    old_ring_dict = device_dict(old_ring_data)
+    new_ring_dict = device_dict(new_ring_data)
     moving_map = build_moving_map(old_ring_data, new_ring_data)
 
     with open(file_name, "w") as f:
-        f.write(json.dumps({"old_device_dict": old_dict,
-                            "new_device_dict": new_dict,
+        f.write(json.dumps({"old_device_dict": old_ring_dict,
+                            "new_device_dict": new_ring_dict,
                             "moving_map": moving_map}))
 
 
@@ -162,28 +197,33 @@ def load_moving_map(file_name=DEFAULT_DUMP_FILE, test_mode=False):
     :param test_mode: controls the printouts for the testing
 
     :returns: the triple that contains:
-    old_dict: the dictionary with devices from old ring,
-    new_dict the dictionary with devices from new ring,
+    old_ring_dict: the dictionary with devices from old ring,
+    new_ring_dict the dictionary with devices from new ring,
     moving_map: the data moving map structure
     """
 
     with open(file_name, "r") as f:
         input_data = json.loads(f.read())
 
-    old_dict = input_data["old_device_dict"]
-    new_dict = input_data["new_device_dict"]
+    old_ring_dict = input_data["old_device_dict"]
+    new_ring_dict = input_data["new_device_dict"]
     moving_map = input_data["moving_map"]
 
     if test_mode:
         counter = 10
         for key in moving_map:
-            part, source, dest = moving_map[key]
-            print part, old_dict[source], new_dict[dest]
+
+            partition, source_device, destination_device = moving_map[key]
+            print (partition,
+                   old_ring_dict[source_device],
+                   new_ring_dict[destination_device])
+
             if counter < 0:
                 break
+
             counter -= 1
 
-    return old_dict, new_dict, moving_map
+    return old_ring_dict, new_ring_dict, moving_map
 
 
 def validate_moving_map_options(options, args):
@@ -296,6 +336,7 @@ class ObjectMover(Daemon):
             self.logger.debug(
                 "Successful rsync of %(src)s at %(dst)s (%(time).03f)",
                 {'src': args[-2], 'dst': args[-1], 'time': total_time})
+
         return ret_val
 
     def rsync(self, node, job, remote_path):
@@ -330,7 +371,7 @@ class ObjectMover(Daemon):
             print " ".join(args)
             return True, {}
 
-    def sync(self, node, job):
+    def sync(self, job):
         """
         Synchronize local suffix directories from a partition with a remote
         node.
@@ -341,6 +382,8 @@ class ObjectMover(Daemon):
 
         :returns: boolean indicating success or failure
         """
+
+        node = job['node']
 
         remote_path = os.path.join(self.devices_dir,
                                    node['device'], self.mover_tmp_dir)
@@ -376,8 +419,7 @@ class ObjectMover(Daemon):
         begin = time.time()
         try:
 
-            for node in job['nodes']:
-                success, _junk = self.sync(node, job)
+            success, _junk = self.sync(job)
             if not success:
                 self.retrie_list.append(job)
 
@@ -445,13 +487,11 @@ class ObjectMover(Daemon):
                     node['replication_ip'] = replication_ip
                     node['device'] = replication_device
 
-                    nodes = [node]
-
                     jobs.append(
                         dict(path=job_path,
                              device=local_dev['device'],
                              obj_path=obj_path,
-                             nodes=nodes,
+                             node=node,
                              policy=policy,
                              partition=partition,
                              region=local_dev['region']))
@@ -505,6 +545,14 @@ class ObjectMover(Daemon):
         policy.load_ring(self.swift_dir)
         return policy.object_ring
 
+    def kill_coros(self):
+        """Utility function that kills all coroutines currently running."""
+        for coro in list(self.run_pool.coroutines_running):
+            try:
+                coro.kill(GreenletExit)
+            except GreenletExit:
+                pass
+
     def move(self, old_dict, new_dict, moving_map):
         """Run a replication pass"""
 
@@ -536,7 +584,10 @@ class ObjectMover(Daemon):
 
                 self.run_pool.spawn(self.update, job)
 
+            self.run_pool.waitall()
+
         except (Exception, Timeout) as e:
+            self.kill_coros()
             self.logger.exception(
                 "Exception in top-level partition move loop %s" % e)
             if self.test:
