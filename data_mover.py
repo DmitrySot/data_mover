@@ -202,6 +202,9 @@ def load_moving_map(file_name=DEFAULT_DUMP_FILE, test_mode=False):
     moving_map: the data moving map structure
     """
 
+    if not os.path.isfile(file_name):
+        raise Exception('the wrong path to the dump file specified.')
+
     with open(file_name, "r") as f:
         input_data = json.loads(f.read())
 
@@ -257,9 +260,6 @@ def validate_moving_map_options(options, args):
     if options.run == "False":
         options.run = ""
 
-    if options.dump_file and not os.path.isfile(options.dump_file):
-        raise Exception('the wrong path to the dump file specified.')
-
 
 class ObjectMover(Daemon):
     def __init__(self, conf):
@@ -275,17 +275,22 @@ class ObjectMover(Daemon):
         self.vm_test_mode = config_true_value(conf.get('vm_test_mode', 'no'))
         self.swift_dir = conf.get('swift_dir', '/etc/swift')
         self.bind_ip = conf.get('bind_ip', '0.0.0.0')
+        self.servers_per_port = int(conf.get('servers_per_port', '0') or 0)
         self.port = None if self.servers_per_port else \
             int(conf.get('bind_port', 6000))
         self.concurrency = int(conf.get('concurrency', 1))
+        self.reclaim_age = int(conf.get('reclaim_age', 86400 * 7))
 
         self.rsync_compress = config_true_value(
             conf.get('rsync_compress', 'no'))
 
+        self.handoffs_first = config_true_value(conf.get('handoffs_first',
+                                                         False))
+
         self.sync_method = getattr(self, conf.get('sync_method') or 'rsync')
 
-        self.data_moving_map_dump = getattr(
-            self, conf.get('data_moving_map_dump') or DEFAULT_DUMP_FILE)
+        self.data_moving_map_dump = (conf.get('data_moving_map_dump')
+                                     or DEFAULT_DUMP_FILE)
 
         self._diskfile_mgr = DiskFileManager(conf, self.logger)
 
