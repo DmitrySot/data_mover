@@ -213,7 +213,8 @@ def load_moving_map(file_name=DEFAULT_DUMP_FILE, test_mode=False):
     moving_map = input_data["moving_map"]
 
     if test_mode:
-        counter = 10
+
+        counter = 15
         for key in moving_map:
 
             partition, source_device, destination_device = moving_map[key]
@@ -221,10 +222,9 @@ def load_moving_map(file_name=DEFAULT_DUMP_FILE, test_mode=False):
                    old_ring_dict[source_device],
                    new_ring_dict[destination_device])
 
-            if counter < 0:
-                break
-
             counter -= 1
+            if counter == 0:
+                break
 
     return old_ring_dict, new_ring_dict, moving_map
 
@@ -281,13 +281,8 @@ class ObjectMover(Daemon):
         self.concurrency = int(conf.get('concurrency', 1))
         self.reclaim_age = int(conf.get('reclaim_age', 86400 * 7))
 
-        self.rsync_compress = config_true_value(
-            conf.get('rsync_compress', 'no'))
-
         self.handoffs_first = config_true_value(conf.get('handoffs_first',
                                                          False))
-
-        self.sync_method = getattr(self, conf.get('sync_method') or 'rsync')
 
         self.data_moving_map_dump = (conf.get('data_moving_map_dump')
                                      or DEFAULT_DUMP_FILE)
@@ -300,6 +295,45 @@ class ObjectMover(Daemon):
 
         self.retrie_list = []
 
+    def create_remote_directory(self, job):
+        """
+        Creates a temporal directory, at remote server.
+
+        :param job: information about the partition being synced
+
+        """
+        node = job['node']
+
+        args = ["ssh", rsync_ip(node['replication_ip']),
+                "mkdir", "-p", job['remote_path']]
+
+        if not self.test:
+            proc = subprocess.Popen(args,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT)
+
+            results = proc.stdout.read()
+            ret_val = proc.wait()
+
+            #TODO: ret_val check
+            (results, ret_val)
+
+        else:
+            print " ".join(args)
+
+    #TODO: same as replicator load_object_ring
+    def load_object_ring(self, policy):
+        """
+        Make sure the policy's rings are loaded.
+
+        :param policy: the StoragePolicy instance
+        :returns: appropriate ring object
+        """
+
+        policy.load_ring(self.swift_dir)
+        return policy.object_ring
+
+    #TODO: check if _rsync from replicator will be used instead
     def _rsync(self, args):
         """
         Execute the rsync binary to replicate a partition.
@@ -344,7 +378,7 @@ class ObjectMover(Daemon):
 
         return ret_val
 
-    def rsync(self, node, job, remote_path):
+    def rsync(self, job):
         """
         Uses rsync to implement the sync method. This was the first
         sync method in Swift.
@@ -364,8 +398,9 @@ class ObjectMover(Daemon):
             '--ignore-existing',
         ]
 
+        node = job['node']
         node_ip = rsync_ip(node['replication_ip'])
-        rsync_module = '%s:%s' % (node_ip, remote_path)
+        rsync_module = '%s:%s' % (node_ip, job['remote_path'])
 
         args.append(job['path'])
         args.append(rsync_module)
@@ -375,42 +410,6 @@ class ObjectMover(Daemon):
         else:
             print " ".join(args)
             return True, {}
-
-    def sync(self, job):
-        """
-        Synchronize local suffix directories from a partition with a remote
-        node.
-
-        :param node: the "dev" entry for the remote node to sync with
-        :param job: information about the partition being synced
-        :param suffixes: a list of suffixes which need to be pushed
-
-        :returns: boolean indicating success or failure
-        """
-
-        node = job['node']
-
-        remote_path = os.path.join(self.devices_dir,
-                                   node['device'], self.mover_tmp_dir)
-
-        args = ["ssh", rsync_ip(node['replication_ip']),
-                "mkdir", "-p", remote_path]
-
-        if not self.test:
-            proc = subprocess.Popen(args,
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT)
-
-            results = proc.stdout.read()
-            ret_val = proc.wait()
-
-            #TODO: ret_val check
-            (results, ret_val)
-
-        else:
-            print " ".join(args)
-
-        return self.sync_method(node, job, remote_path)
 
     def update(self, job):
         """
@@ -424,7 +423,8 @@ class ObjectMover(Daemon):
         begin = time.time()
         try:
 
-            success, _junk = self.sync(job)
+            self.create_remote_directory(job)
+            success, _junk = self.rsync(job)
             if not success:
                 self.retrie_list.append(job)
 
@@ -434,11 +434,27 @@ class ObjectMover(Daemon):
             self.partition_times.append(time.time() - begin)
             self.logger.timing_since('partition.update.timing', begin)
 
+#TODO: same as replicator kill coros
+    def kill_coros(self):
+        """Utility function that kills all coroutines currently running."""
+        for coro in list(self.run_pool.coroutines_running):
+            try:
+                coro.kill(GreenletExit)
+            except GreenletExit:
+                pass
+
     def build_replication_jobs(self, policy, ips, old_dict,
                                new_dict, moving_map):
         """
         Helper function for collect_jobs to build jobs for replication
         using replication style storage policy
+
+        :param policy: swift policy object
+        :param ips: the local server ips
+        :param old_dict: dictionary with devices from old ring
+        :param new_dict: dictionary with devices from new ring
+        :param moving_map: the dictionary that contains all the partitions
+            that should be moved, their sources and destinations
         """
 
         jobs = []
@@ -492,6 +508,10 @@ class ObjectMover(Daemon):
                     node['replication_ip'] = replication_ip
                     node['device'] = replication_device
 
+                    remote_path = os.path.join(self.devices_dir,
+                                               node['device'],
+                                               self.mover_tmp_dir)
+
                     jobs.append(
                         dict(path=job_path,
                              device=local_dev['device'],
@@ -499,7 +519,8 @@ class ObjectMover(Daemon):
                              node=node,
                              policy=policy,
                              partition=partition,
-                             region=local_dev['region']))
+                             remote_path=remote_path))
+
                 except ValueError:
                     continue
                 except Exception as e:
@@ -514,12 +535,10 @@ class ObjectMover(Daemon):
         Returns a sorted list of jobs (dictionaries) that specify the
         partitions, nodes, etc to be rsynced.
 
-        :param override_devices: if set, only jobs on these devices
-            will be returned
-        :param override_partitions: if set, only jobs on these partitions
-            will be returned
-        :param override_policies: if set, only jobs in these storage
-            policies will be returned
+        :param old_dict: dictionary with devices from old ring
+        :param new_dict: dictionary with devices from new ring
+        :param moving_map: the dictionary that contains all the partitions
+            that should be moved, their sources and destinations
         """
 
         jobs = []
@@ -532,34 +551,17 @@ class ObjectMover(Daemon):
                 jobs += self.build_replication_jobs(
                     policy, ips, old_dict, new_dict, moving_map)
         random.shuffle(jobs)
-        if self.handoffs_first:
-            # Move the handoff parts to the front of the list
-            jobs.sort(key=lambda job: not job['delete'])
-        self.job_count = len(jobs)
 
         return jobs
 
-    def load_object_ring(self, policy):
-        """
-        Make sure the policy's rings are loaded.
-
-        :param policy: the StoragePolicy instance
-        :returns: appropriate ring object
-        """
-
-        policy.load_ring(self.swift_dir)
-        return policy.object_ring
-
-    def kill_coros(self):
-        """Utility function that kills all coroutines currently running."""
-        for coro in list(self.run_pool.coroutines_running):
-            try:
-                coro.kill(GreenletExit)
-            except GreenletExit:
-                pass
-
     def move(self, old_dict, new_dict, moving_map):
-        """Run a replication pass"""
+        """Run a move pass.
+
+        :param old_dict: dictionary with devices from old ring
+        :param new_dict: dictionary with devices from new ring
+        :param moving_map: the dictionary that contains all the partitions
+            that should be moved, their sources and destinations
+        """
 
         self.start = time.time()
         self.replication_count = 0
